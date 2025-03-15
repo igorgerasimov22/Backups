@@ -1,0 +1,147 @@
+---
+- name: Configure backup server
+  hosts: all
+  become: true
+  tasks:
+    - name: Update package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: install borgbackup
+      #hosts: backup-srv
+      ansible.builtin.apt:
+        name: borgbackup
+        state: present
+
+    - name: Add borg group
+      #hosts: backup-srv
+      ansible.builtin.group:
+        name: borg
+        state: present
+
+    - name: Add borg user
+      #hosts: backup-srv
+      ansible.builtin.user:
+        name: borg
+        group: borg
+        state: present
+        home: /home/borg
+        shell: /bin/bash
+    
+    - name: Add user folder
+      ansible.builtin.file:
+        path: /home/borg
+        owner: borg
+        group: borg
+
+# ---------- SERVER ---------- #
+    - name: Create backup folder
+      #hosts: backup-srv
+      ansible.builtin.file:
+        path: /var/backup
+        state: directory
+        owner: borg 
+        group: borg
+        mode: '0755'
+      when: inventory_hostname in groups["backup-srv"]
+
+    - name: Create authorized_keys files
+      ansible.builtin.file:
+        path: /home/borg/.ssh/authorized_keys
+        state: file
+        owner: borg
+        group: borg
+        mode: '0600'
+      when: inventory_hostname in groups["backup-srv"]
+
+# ---------- CLIENT ---------- #
+    - name: Add SSH folder
+      ansible.builtin.file:
+        path: /home/borg/.ssh
+        state: directory
+        owner: borg
+        group: borg
+        mode: '0700'
+      when: inventory_hostname in groups["backup-cl"]
+
+    - name: Generate SSH key
+      community.crypto.openssh_keypair:
+        path: /home/borg/.ssh/id_ed25519
+        type: ed25519
+        owner: borg
+        group: borg
+      register: key_result
+      when: inventory_hostname in groups["backup-cl"]
+
+    - name: Set public SSH key variable
+      ansible.builtin.set_fact:
+        public_ssh_key: "{{ key_result.public_key }}"
+      when: inventory_hostname in groups["backup-cl"]
+
+    - name: Получение открытого ключа пользователя Borg
+      slurp:
+        src: /home/borg/.ssh/id_ed25519.pub
+      register: borg_ssh_key
+      when: inventory_hostname in groups["backup-cl"]
+
+    - name: Декодирование открытого ключа
+      set_fact:
+        ssh_key_borg: "{{ borg_ssh_key.content | b64decode }}"
+      when: inventory_hostname in groups["backup-cl"]
+
+    - name: Добавление открытого ключа на сервер 2
+      authorized_key:
+        user: borg
+        state: present
+        key: "{{ ssh_key_borg }}"
+      delegate_to: backup-server
+      when: inventory_hostname in groups["backup-cl"]
+
+    - name: Initialize borg repo
+      ansible.builtin.shell: |
+        su - borg -c "borg init --encryption=none borg@192.168.88.230:/var/backup/"
+      register: borg_init_result
+      ignore_errors: yes
+      when: inventory_hostname in groups["backup-cl"]
+
+    - name: Check if repository already exists
+      ansible.builtin.debug:
+        msg: "Warning: A repository already exists at borg@192.168.88.230:/var/backup/."
+      when: borg_init_result.rc == 2  
+    
+    - name: Continue with other tasks
+      debug:
+        msg: "Continuing with other tasks..."
+
+    - name: Run backup
+      ansible.builtin.shell: |
+        su - borg -c "borg create --stats --list borg@192.168.88.230:/var/backup/::"etc-{now:%Y-%m-%d_%H:%M:%S}" /etc"
+      ignore_errors: true
+      when: inventory_hostname in groups["backup-cl"]
+
+    - name: Copy borg-backup.service
+      ansible.builtin.copy:
+        src: ~/ansible/Backups/borg-backup.service
+        dest: /etc/systemd/system/borg-backup.service
+        mode: '0755'
+        remote_src: no
+      notify: Enable timer
+      when: inventory_hostname in groups["backup-cl"]
+
+    - name: Copy borg-backup.timer
+      ansible.builtin.copy:
+        src: ~/ansible/Backups/borg-backup.timer
+        dest: /etc/systemd/system/borg-backup.timer
+        mode: '0755'
+        remote_src: no
+      notify: Enable timer
+      when: inventory_hostname in groups["backup-cl"]
+
+  handlers:
+    - name: Enable timer
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: borg-backup.timer
+        enabled: true
+        state: started
